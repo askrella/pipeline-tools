@@ -1,0 +1,126 @@
+name: govulncheck
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  GOLANG_VERSION: 1.24.2
+
+jobs:
+  govulncheck:
+    strategy:
+      matrix:
+        runner: [ ubuntu-24.0.4-arm64-small, ubuntu-24.0.4-amd64-small ]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build govulncheck image
+        run: docker build --build-arg GOLANG_VERSION=${{ env.GOLANG_VERSION }} -f docker/govulncheck.Dockerfile -t govulncheck .
+
+      - name: Report image size (original)
+        run: docker images govulncheck
+
+      - name: Run original govulncheck and check for vulnerabilities
+        working-directory: scenarios/vulnerable
+        run: |
+          # Run govulncheck and store output
+          output=$(docker run --rm -v "$PWD":/app govulncheck:latest . 2>&1 || true)
+          echo "$output"
+          
+          # Check for specific vulnerabilities
+          if echo "$output" | grep -q "GO-2021-0113\|GO-2022-1059"; then
+            echo "Found expected vulnerabilities GO-2021-0113 and GO-2022-1059"
+            exit 0
+          else
+            echo "Error: Expected vulnerabilities GO-2021-0113 and GO-2022-1059 not found in output"
+            exit 1
+          fi
+
+      - name: Install docker-slim
+        run: |
+          curl -sL https://raw.githubusercontent.com/slimtoolkit/slim/master/scripts/install-slim.sh | sudo -E bash -
+
+      - name: Run docker-slim build
+        working-directory: scenarios/vulnerable
+        run: |
+          docker-slim build \
+            --target govulncheck \
+            --cmd govulncheck \
+            --exec "govulncheck . 2>&1 || true" \
+            --mount "$PWD/go.mod:/app/go.mod" \
+            --mount "$PWD/go.sum:/app/go.sum" \
+            --mount "$PWD/main.go:/app/main.go" \
+            --include-path "/usr/local/go/pkg/tool" \
+            --include-path "/usr/local/go/src" \
+            --http-probe=false
+
+      - name: Report image size before compression (slim)
+        run: docker images govulncheck.slim
+
+      - name: Compress slim image
+        working-directory: docker
+        run: |
+          docker buildx build \
+            --builder default \
+            --file govulncheck.compress.Dockerfile \
+            --cache-from govulncheck.slim \
+            --tag govulncheck.slim \
+            --output type=image,push=false,compression=zstd,compression-level=22 \
+            .
+
+      - name: Run slim govulncheck and check for vulnerabilities
+        working-directory: scenarios/vulnerable
+        run: |
+          # Run govulncheck.slim and store output
+          output=$(docker run --rm -v "$PWD":/app govulncheck.slim . 2>&1 || true)
+          echo "$output"
+          
+          # Check for specific vulnerabilities
+          if echo "$output" | grep -q "GO-2021-0113\|GO-2022-1059"; then
+            echo "Found expected vulnerabilities GO-2021-0113 and GO-2022-1059"
+            exit 0
+          else
+            echo "Error: Expected vulnerabilities GO-2021-0113 and GO-2022-1059 not found in output"
+            exit 1
+          fi
+
+      - name: Report image size after compression (slim)
+        run: docker images govulncheck.slim
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push slim image to GHCR
+        run: |
+          # Tag the slim image for GHCR
+          docker tag govulncheck.slim ghcr.io/${{ github.repository }}/govulncheck:latest-slim
+          # Push the image
+          docker push ghcr.io/${{ github.repository }}/govulncheck:latest-slim
+
+      - name: Create image size comparison summary
+        run: |
+          # Get image sizes
+          original_size=$(docker images govulncheck --format "{{.Size}}")
+          slim_size=$(docker images govulncheck.slim --format "{{.Size}}")
+          
+          # Create markdown summary
+          echo "### 📊 Image Size Comparison" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | Size |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Original Image | $original_size |" >> $GITHUB_STEP_SUMMARY
+          echo "| Slim Image | $slim_size |" >> $GITHUB_STEP_SUMMARY
