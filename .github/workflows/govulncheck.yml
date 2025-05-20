@@ -12,7 +12,7 @@ jobs:
   govulncheck:
     strategy:
       matrix:
-        runner: [ ubuntu-24.0.4-arm64-small, ubuntu-24.0.4-amd64-small ]
+        runner: [ ubuntu-latest ]
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
