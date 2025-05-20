@@ -18,5 +18,3 @@ updates:
     commit-message:
       prefix: "chore"
       include: "scope"
-    ignore-paths:
-      - "scenarios/vulnerable/**"
