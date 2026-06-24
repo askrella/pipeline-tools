@@ -1,0 +1,19 @@
+name: Resolve Go version
+description: >-
+  Read the Go version pinned in go.mod and expose it as an output so Docker
+  builds can pass it as a build-arg instead of hardcoding the toolchain.
+  Single source of truth for the version-extraction logic. Expects the repo
+  (at least go.mod) to already be checked out.
+
+outputs:
+  version:
+    description: The Go version from go.mod (e.g. 1.26.4)
+    value: ${{ steps.resolve.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve Go version
+      id: resolve
+      shell: bash
+      run: echo "version=$(awk '/^go / {print $2; exit}' go.mod)" >> "$GITHUB_OUTPUT"

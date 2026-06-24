@@ -1,0 +1,70 @@
+name: PR
+
+# Runs the full check suite on every pull request. Reusable ci-* units do the
+# real work; this file just wires them together and, for Dependabot PRs that
+# pass everything, enables auto-merge for patch and minor updates.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    uses: ./.github/workflows/ci-lint.yml
+
+  secret-scan:
+    uses: ./.github/workflows/ci-secret-scan.yml
+
+  test:
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/ci-test.yml
+
+  build:
+    # id-token/attestations are required because the called ci-build.yml declares
+    # a publish job that requests them; the ceiling must allow it even though
+    # publish is skipped here (push: false).
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/ci-build.yml
+    with:
+      push: false
+      slim: true
+
+  # Auto-merge Dependabot PRs once every check above is green. Patch and minor
+  # only; major bumps are left for a human. Requires "Allow auto-merge" and a
+  # branch protection rule requiring these checks, otherwise --auto merges early.
+  dependabot-automerge:
+    needs: [lint, secret-scan, test, build]
+    if: ${{ github.actor == 'dependabot[bot]' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enable auto-merge (patch and minor)
+        if: ${{ steps.meta.outputs.update-type == 'version-update:semver-patch' || steps.meta.outputs.update-type == 'version-update:semver-minor' }}
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge --auto --squash "$PR_URL"
+
+      - name: Note skipped major update
+        if: ${{ steps.meta.outputs.update-type == 'version-update:semver-major' }}
+        run: echo "::notice::Major update (${{ steps.meta.outputs.dependency-names }}) left for manual review."

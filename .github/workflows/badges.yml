@@ -1,0 +1,92 @@
+name: Badges
+
+# Publishes shields.io endpoint JSON for the current image sizes to an orphan
+# `badges` branch, which the README links to. GHCR has no native shields badge,
+# so we compute the compressed size from the published manifests ourselves. We
+# host the JSON instead of using a third-party badge service, to avoid a runtime
+# dependency in a security focused repo.
+#
+# Runs after a release or a vuln DB refresh (which change the images), and daily
+# as a safety net.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '37 6 * * *'
+  workflow_run:
+    workflows: ['Release', 'Vuln DB refresh']
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: badges
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: read
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Compute size badges
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}/govulncheck
+        run: |
+          set -uo pipefail
+          mkdir -p out
+
+          # Compressed size (sum of layer blob sizes + config) of the amd64
+          # variant of a tag. Handles both manifest lists and single manifests.
+          size_bytes() {
+            local ref="$IMAGE:$1" raw man dig
+            raw=$(docker buildx imagetools inspect "$ref" --raw 2>/dev/null) || return 1
+            if echo "$raw" | jq -e '.manifests' >/dev/null 2>&1; then
+              dig=$(echo "$raw" | jq -r '.manifests[] | select(.platform.architecture=="amd64" and .platform.os=="linux") | .digest' | head -1)
+              [ -n "$dig" ] || return 1
+              man=$(docker buildx imagetools inspect "${IMAGE}@${dig}" --raw) || return 1
+            else
+              man="$raw"
+            fi
+            echo "$man" | jq '([.layers[].size] | add) + (.config.size // 0)'
+          }
+
+          badge() { # label  tag  outfile
+            local bytes mb
+            bytes=$(size_bytes "$2") || { echo "skip $2 (not found)"; return 0; }
+            mb=$(awk "BEGIN{printf \"%.1f\", $bytes/1048576}")
+            jq -nc --arg label "$1" --arg msg "${mb} MB" \
+              '{schemaVersion:1,label:$label,message:$msg,color:"blue"}' > "out/$3"
+            echo "$1: ${mb} MB"
+          }
+
+          badge "full image"    latest               full.json
+          badge "slim image"    latest-slim          slim.json
+          badge "offline image" latest-slim-offline  offline.json
+          ls -la out
+
+      - name: Publish to badges branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd out
+          git init -q
+          git checkout -q -b badges
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add .
+          git commit -qm "chore: update image size badges"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" badges

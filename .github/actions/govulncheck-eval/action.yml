@@ -1,0 +1,190 @@
+name: govulncheck drift check
+description: >-
+  Run govulncheck several ways against the same target and compare what each one
+  detects. Answers "does this image really replace my go install govulncheck
+  step, or will it break / silently find fewer vulnerabilities?" Drop it into any
+  job as a step to verify an image variant before adopting it. Compares the set
+  of detected OSV IDs, so log-formatting differences never cause false drift; a
+  variant that produces no valid output counts as drift too.
+
+inputs:
+  directory:
+    description: 'Directory containing the go.mod to scan'
+    default: '.'
+  pattern:
+    description: 'Package pattern passed to govulncheck'
+    default: './...'
+  scan:
+    description: 'Extra govulncheck flags shared by every variant'
+    default: '-scan=symbol'
+  enable-native:
+    description: 'Run the canonical `go install` govulncheck path'
+    default: 'true'
+  enable-full:
+    description: 'Run the full image variant'
+    default: 'true'
+  enable-slim:
+    description: 'Run the slim image variant'
+    default: 'true'
+  fail-on-drift:
+    description: 'Fail the step if variants disagree'
+    default: 'true'
+  image:
+    description: 'Image reference without tag'
+    default: 'ghcr.io/askrella/pipeline-tools/govulncheck'
+  full-tag:
+    description: 'Tag for the full image variant'
+    default: 'latest'
+  slim-tag:
+    description: 'Tag for the slim image variant'
+    default: 'latest-slim'
+  native-version:
+    description: 'Version for `go install govulncheck@<version>`'
+    default: 'latest'
+  go-version:
+    description: 'Go toolchain used to run the native variant'
+    default: 'stable'
+  offline:
+    description: >-
+      Run the container variants air-gapped: no network and the bundled
+      vulnerability database at db-path. Use this to validate offline images.
+      The native variant stays online and serves as the reference.
+    default: 'false'
+  db-path:
+    description: 'Path to the bundled vuln DB inside the offline image'
+    default: '/opt/vulndb'
+
+outputs:
+  drift:
+    description: 'true if any variant disagreed with the reference'
+    value: ${{ steps.eval.outputs.drift }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Go (native variant)
+      if: ${{ inputs.enable-native == 'true' }}
+      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+      with:
+        go-version: ${{ inputs.go-version }}
+
+    - name: Run variants and compare
+      id: eval
+      shell: bash
+      # Scan parameters come from env, never interpolated into the script body,
+      # to avoid shell injection. $SCAN/$PATTERN/$db flags stay unquoted on
+      # purpose so they word-split into multiple literal govulncheck args.
+      env:
+        DIRECTORY: ${{ inputs.directory }}
+        PATTERN: ${{ inputs.pattern }}
+        SCAN: ${{ inputs.scan }}
+        ENABLE_NATIVE: ${{ inputs.enable-native }}
+        ENABLE_FULL: ${{ inputs.enable-full }}
+        ENABLE_SLIM: ${{ inputs.enable-slim }}
+        FAIL_ON_DRIFT: ${{ inputs.fail-on-drift }}
+        IMAGE: ${{ inputs.image }}
+        FULL_TAG: ${{ inputs.full-tag }}
+        SLIM_TAG: ${{ inputs.slim-tag }}
+        NATIVE_VERSION: ${{ inputs.native-version }}
+        OFFLINE: ${{ inputs.offline }}
+        DB_PATH: ${{ inputs.db-path }}
+      run: |
+        set -uo pipefail
+        work="$RUNNER_TEMP/gvc-eval"
+        rm -rf "$work"; mkdir -p "$work"
+        : > "$work/meta.tsv"
+
+        run_variant() {
+          name="$1"; type="$2"; ref="$3"
+          raw="$work/$name.json"; err="$work/$name.stderr"; code=0
+          if [ "$type" = "native" ]; then
+            go install "golang.org/x/vuln/cmd/govulncheck@${ref}"
+            gvc="$(go env GOPATH)/bin/govulncheck"
+            version="$("$gvc" -version 2>/dev/null | tr '\n\t' '  ' | sed 's/  */ /g' | cut -c1-160)"
+            ( cd "$DIRECTORY" && "$gvc" -json $SCAN $PATTERN ) > "$raw" 2> "$err" || code=$?
+          else
+            version="$ref"
+            db_flag=""; net=""
+            if [ "$OFFLINE" = "true" ]; then db_flag="-db file://$DB_PATH"; net="--network none"; fi
+            docker run --rm $net \
+              -v "$PWD":/app -w "/app/${DIRECTORY#./}" \
+              "$ref" -json $SCAN $db_flag $PATTERN > "$raw" 2> "$err" || code=$?
+          fi
+          [ -n "${version:-}" ] || version="$ref"
+
+          objs=$(jq -s 'length' "$raw" 2>/dev/null || echo 0)
+          if [ "${objs:-0}" -ge 1 ]; then ran=true; else ran=false; fi
+          jq -r 'select(.finding != null) | .finding.osv' "$raw" 2>/dev/null | sort -u > "$work/$name.findings" || true
+          found=$(wc -l < "$work/$name.findings" | tr -d ' ')
+
+          printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$version" "$code" "$ran" "$found" >> "$work/meta.tsv"
+          echo "Variant '$name': ran=$ran exit=$code findings=$found"
+          echo "----- $name stderr -----"; cat "$err" || true
+        }
+
+        [ "$ENABLE_NATIVE" = "true" ] && run_variant native native "$NATIVE_VERSION"
+        [ "$ENABLE_FULL" = "true" ]   && run_variant full container "$IMAGE:$FULL_TAG"
+        [ "$ENABLE_SLIM" = "true" ]   && run_variant slim container "$IMAGE:$SLIM_TAG"
+
+        declare -A RAN VER CODE FOUND
+        names=()
+        while IFS=$'\t' read -r name version code ran found; do
+          names+=("$name"); VER[$name]=$version; CODE[$name]=$code; RAN[$name]=$ran; FOUND[$name]=$found
+        done < "$work/meta.tsv"
+
+        n=${#names[@]}
+        echo "Discovered $n variant(s): ${names[*]:-<none>}"
+
+        ref=""
+        for pref in native full slim; do
+          for nm in "${names[@]}"; do [ "$nm" = "$pref" ] && ref="$nm" && break; done
+          [ -n "$ref" ] && break
+        done
+        [ -n "$ref" ] || ref="${names[0]:-}"
+
+        findings_file() { f="$work/$1.findings"; [ -f "$f" ] && echo "$f" || echo /dev/null; }
+
+        {
+          echo "### govulncheck drift check"
+          echo ""
+          echo "Reference: \`${ref:-n/a}\` · scan: \`$SCAN $PATTERN\` · dir: \`$DIRECTORY\` · offline: \`$OFFLINE\`"
+          echo ""
+          echo "| Variant | Version | Ran | Exit | Findings | vs \`$ref\` |"
+          echo "| --- | --- | --- | --- | --- | --- |"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        drift=0; details=""
+        for nm in "${names[@]}"; do
+          verdict="-"
+          if [ "$nm" != "$ref" ] && [ -n "$ref" ]; then
+            missing=$(comm -23 "$(findings_file "$ref")" "$(findings_file "$nm")")
+            extra=$(comm -13 "$(findings_file "$ref")" "$(findings_file "$nm")")
+            if [ "${RAN[$nm]}" != "${RAN[$ref]}" ] || [ -n "$missing" ] || [ -n "$extra" ]; then
+              drift=1; verdict="drift"
+              details+=$'\n'"<details><summary>$nm vs $ref</summary>"$'\n\n'
+              [ "${RAN[$nm]}" != "${RAN[$ref]}" ] && details+="- ran: $nm=${RAN[$nm]} vs $ref=${RAN[$ref]}"$'\n'
+              [ -n "$missing" ] && details+="- missed (present in $ref): $(echo $missing | tr '\n' ' ')"$'\n'
+              [ -n "$extra" ] && details+="- extra (absent in $ref): $(echo $extra | tr '\n' ' ')"$'\n'
+              details+=$'\n'"</details>"$'\n'
+            else
+              verdict="match"
+            fi
+          fi
+          [ "${RAN[$nm]}" = "true" ] || verdict="did not run"
+          echo "| $nm | ${VER[$nm]} | ${RAN[$nm]} | ${CODE[$nm]} | ${FOUND[$nm]} | $verdict |" >> "$GITHUB_STEP_SUMMARY"
+        done
+        [ -n "$details" ] && { echo ""; echo "$details"; } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$drift" -eq 1 ]; then echo "drift=true" >> "$GITHUB_OUTPUT"; else echo "drift=false" >> "$GITHUB_OUTPUT"; fi
+
+        if [ "$n" -lt 2 ]; then
+          echo "::warning::Only $n variant available — nothing to compare."
+          exit 0
+        fi
+        if [ "$drift" -eq 1 ]; then
+          echo "::error::Drift detected between govulncheck variants (see job summary)."
+          [ "$FAIL_ON_DRIFT" = "true" ] && exit 1
+          echo "::warning::fail-on-drift is false — not failing."
+        else
+          echo "No drift: all variants agree."
+        fi

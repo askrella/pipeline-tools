@@ -1,0 +1,70 @@
+name: Push main
+
+# Re-runs the checks on main and, when they pass, builds and pushes nightly
+# sha-tagged images, then runs the drift check against those freshly pushed
+# images.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: push-main
+  cancel-in-progress: false
+
+jobs:
+  lint:
+    uses: ./.github/workflows/ci-lint.yml
+
+  secret-scan:
+    uses: ./.github/workflows/ci-secret-scan.yml
+
+  test:
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/ci-test.yml
+
+  build:
+    needs: [lint, secret-scan, test]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write      # ci-build's publish job attests the SBOM
+      attestations: write
+    uses: ./.github/workflows/ci-build.yml
+    with:
+      push: true
+      slim: true
+      tags: 'nightly'
+      tag-with-sha: true
+
+  # Call the eval action via its local path so this repo exercises its OWN copy
+  # of the action (including local changes), not a published version. That
+  # matters in a fork or mirror.
+  drift:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 1
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/govulncheck-eval
+        with:
+          directory: scenarios/vulnerable
+          pattern: './...'
+          image: ghcr.io/${{ github.repository }}/govulncheck
+          full-tag: nightly
+          slim-tag: nightly-slim
+          fail-on-drift: true

@@ -1,0 +1,227 @@
+name: 'Govulncheck Action'
+description: |
+  Run govulncheck against a specified directory using a minimal Docker image.
+  This action performs vulnerability scanning on Go code and can be configured to fail on detected vulnerabilities.
+
+inputs:
+  directory:
+    description: 'Directory to scan for vulnerabilities (must exist and contain a go.mod file)'
+    required: false
+    default: '.'
+  fail-on-vuln:
+    description: 'Whether to fail the action if vulnerabilities are found'
+    required: false
+    default: 'true'
+  parameters:
+    description: 'Additional parameters to pass to govulncheck (e.g. "-json -v")'
+    required: false
+    default: ''
+  version:
+    description: 'Version tag for the govulncheck Docker image'
+    required: false
+    default: 'latest-slim'
+  image:
+    description: >-
+      Image reference without tag. Override to pull from a different registry or
+      namespace (for example a fork or mirror).
+    required: false
+    default: 'ghcr.io/askrella/pipeline-tools/govulncheck'
+  offline:
+    description: >-
+      Run air-gapped against the bundled vulnerability database. Switches the
+      default image to latest-slim-offline, points govulncheck at the bundled DB,
+      and sets GOPROXY=off so a missing module fails fast instead of reaching the
+      network. Your project modules must already be available offline (vendored or
+      cached). The latest-slim-offline tag is mutable and cannot be pinned.
+    required: false
+    default: 'false'
+
+outputs:
+  scan-output:
+    description: 'The complete output from the vulnerability scan'
+    value: ${{ steps.run-scan.outputs.scan-output }}
+  error-output:
+    description: 'Any errors or warnings encountered during the scan'
+    value: ${{ steps.run-scan.outputs.error-output }}
+  has-vulnerabilities:
+    description: 'Boolean indicating whether vulnerabilities were found'
+    value: ${{ steps.run-scan.outputs.has-vulnerabilities }}
+  duration_ms:
+    description: 'Execution time in milliseconds'
+    value: ${{ steps.run-scan.outputs.duration_ms }}
+
+# NOTE: composite actions do not honor a top-level `permissions:` block — it is
+# silently ignored. The CALLING workflow must grant the job the permissions it
+# needs: `packages: read` to pull the image from GHCR (and `contents: read`).
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate inputs
+      shell: bash
+      # Inputs are passed via env, never interpolated into the script body, to
+      # avoid shell injection from attacker-controlled input values.
+      env:
+        DIRECTORY: ${{ inputs.directory }}
+        FAIL_ON_VULN: ${{ inputs.fail-on-vuln }}
+      run: |
+        if [ ! -d "$DIRECTORY" ]; then
+          echo "::error::Directory '$DIRECTORY' does not exist"
+          exit 1
+        fi
+
+        if [ ! -f "$DIRECTORY/go.mod" ]; then
+          echo "::error::No go.mod file found in directory '$DIRECTORY'"
+          exit 1
+        fi
+
+        if [ "$FAIL_ON_VULN" != "true" ] && [ "$FAIL_ON_VULN" != "false" ]; then
+          echo "::error::fail-on-vuln must be either 'true' or 'false'"
+          exit 1
+        fi
+
+    - name: Run govulncheck
+      id: run-scan
+      shell: bash
+      # Inputs are passed via env, never interpolated into the script body, to
+      # avoid shell injection from attacker-controlled input values.
+      env:
+        DIRECTORY: ${{ inputs.directory }}
+        PARAMETERS: ${{ inputs.parameters }}
+        VERSION: ${{ inputs.version }}
+        IMAGE: ${{ inputs.image }}
+        FAIL_ON_VULN: ${{ inputs.fail-on-vuln }}
+        OFFLINE: ${{ inputs.offline }}
+        DB_PATH: '/opt/vulndb'
+      run: |
+        echo "Running govulncheck on directory: $DIRECTORY"
+
+        # Debug information
+        echo "📁 Current directory structure:"
+        ls -la "$DIRECTORY" || echo "Failed to list directory"
+        echo ""
+        echo "📄 go.mod content:"
+        cat "$DIRECTORY/go.mod" || echo "Failed to read go.mod"
+        echo ""
+        
+        # Create temporary files with secure permissions
+        stdout_file=$(mktemp -t govulncheck.stdout.XXXXXX)
+        stderr_file=$(mktemp -t govulncheck.stderr.XXXXXX)
+        chmod 600 "$stdout_file" "$stderr_file"
+        
+        # Normalize directory path
+        dir_path="$DIRECTORY"
+        dir_path="${dir_path#./}"  # Remove leading ./
+        dir_path="${dir_path%/}"   # Remove trailing /
+        
+        echo "🔍 Using directory path: $dir_path"
+
+        # Offline mode: use the bundled DB image, point govulncheck at the local
+        # database, and disable the module proxy so a missing module fails fast.
+        db_args=""
+        proxy_env=""
+        if [ "$OFFLINE" = "true" ]; then
+          [ "$VERSION" = "latest-slim" ] && VERSION="latest-slim-offline"
+          db_args="-db file://$DB_PATH"
+          proxy_env="-e GOPROXY=off"
+          echo "🔌 Offline mode: image tag=$VERSION, db=file://$DB_PATH, GOPROXY=off"
+        fi
+
+        # Run govulncheck in Docker with debug output
+        echo "🐳 Running Docker command..."
+        start_time=$(date +%s%N)
+        # $PARAMETERS / $db_args / $proxy_env are intentionally unquoted so they
+        # split into multiple args. They come from env (not workflow expressions),
+        # so they cannot inject shell commands, only word-split into docker args.
+        set -x
+        docker run --rm $proxy_env \
+          -v "$PWD":/app \
+          -w "/app/${dir_path}" \
+          "${IMAGE}:${VERSION}" \
+          -scan=symbol $db_args $PARAMETERS . 2>"$stderr_file" >"$stdout_file" && docker_exit=0 || docker_exit=$?
+        { set +x; } 2>/dev/null
+        end_time=$(date +%s%N)
+        
+        duration_ms=$(( (end_time - start_time) / 1000000 ))
+        echo "🔍 Docker exit code: $docker_exit"
+        echo "⏱️  Execution time: ${duration_ms}ms"
+        
+        # Debug output contents
+        echo "📝 stdout content:"
+        cat "$stdout_file" || echo "Failed to read stdout"
+        echo ""
+        echo "⚠️ stderr content:"
+        cat "$stderr_file" || echo "Failed to read stderr"
+        echo ""
+        
+        # Read the outputs (before the trap executes)
+        stdout=$(cat "$stdout_file")
+        stderr=$(cat "$stderr_file")
+        
+        # Now set the trap
+        trap 'rm -f "$stdout_file" "$stderr_file"' EXIT
+        
+        # Debug: Show what we captured
+        echo "📊 Captured stdout length: ${#stdout}"
+        echo "📊 Captured stderr length: ${#stderr}"
+        
+        # Set output parameters with proper EOF delimiter
+        EOF_DELIMITER=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+        
+        # Determine if vulnerabilities were found
+        # govulncheck exit codes: 0=no vulns, 1=vulns found, 3=vulns found (alternate), 2=error
+        has_vulns="false"
+        if [ $docker_exit -eq 1 ] || [ $docker_exit -eq 3 ]; then
+          has_vulns="true"
+        fi
+        
+        {
+          echo "scan-output<<$EOF_DELIMITER"
+          echo "$stdout"
+          echo "$EOF_DELIMITER"
+          
+          echo "error-output<<$EOF_DELIMITER"
+          echo "$stderr"
+          echo "$EOF_DELIMITER"
+          
+          echo "has-vulnerabilities=$has_vulns"
+          echo "duration_ms=$duration_ms"
+        } >> $GITHUB_OUTPUT
+        
+        echo "📊 Set GITHUB_OUTPUT with has-vulnerabilities=$has_vulns, duration=${duration_ms}ms"
+        
+        # Handle different exit codes
+        case $docker_exit in
+          0)
+            echo "✅ No vulnerabilities found"
+            ;;
+          1|3)
+            echo "🚨 Vulnerabilities found"
+            ;;
+          2)
+            echo "❌ Error: govulncheck failed to analyze code"
+            echo "::error::govulncheck failed to execute properly. Check the logs above for details."
+            exit $docker_exit
+            ;;
+          *)
+            echo "❌ Error: Unknown error occurred (exit code: $docker_exit)"
+            echo "::error::govulncheck encountered an unexpected error (exit code: $docker_exit)"
+            exit $docker_exit
+            ;;
+        esac
+        
+        # Handle fail-on-vuln setting
+        if [ "$has_vulns" = "true" ]; then
+          if [ "$FAIL_ON_VULN" = "true" ]; then
+            echo "::error::🚨 Vulnerabilities found - check scan output for details"
+            exit 1
+          else
+            echo "::warning::⚠️ Vulnerabilities found - check scan output for details"
+          fi
+        fi
+        
+        exit 0
+
+branding:
+  icon: 'shield'
+  color: 'green' 

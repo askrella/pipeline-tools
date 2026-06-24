@@ -1,0 +1,61 @@
+version: 2
+updates:
+  # Root module only. `directory` (singular) scans just this go.mod and does
+  # NOT recurse, so scenarios/* (which have their own go.mod files and are
+  # intentional vulnerability reproduction cases) are never touched.
+  # Do not switch to `directories: ["/**"]`, that would pull scenarios in.
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    groups:
+      dependencies:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "go"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # Keep the SHA-pinned third-party actions in .github/workflows fresh.
+  # Without this, pinning to commit SHAs would silently rot.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    groups:
+      actions:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # Keep the Docker base images fresh. Dependabot's docker updater matches any
+  # filename containing "dockerfile" (regex /dockerfile|containerfile/i), so the
+  # *.Dockerfile names here are covered. It bumps pinned `FROM` tags/digests such
+  # as the alpine base in the full image. ARG-based FROMs (the golang builder,
+  # the offline BASE) and the pinned GOVULNCHECK_VERSION arg are not managed by
+  # the docker updater and stay manual.
+  - package-ecosystem: "docker"
+    directory: "/docker"
+    schedule:
+      interval: "daily"
+    groups:
+      docker:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "chore"
+      include: "scope"

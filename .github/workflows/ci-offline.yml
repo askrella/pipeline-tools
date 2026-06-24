@@ -1,0 +1,220 @@
+name: ci-offline
+
+# Builds and publishes the offline slim image: the slim base plus a bundled copy
+# of the Go vulnerability database, for air-gapped sandboxes. Only rebuilds when
+# the database actually changed (compared via the modified timestamp stored as a
+# label on the published image), and validates the candidate fully air-gapped
+# (no network, bundled DB) against the canonical native tool before pushing.
+
+on:
+  workflow_call:
+    inputs:
+      force:
+        description: 'Rebuild even if the database is unchanged'
+        type: boolean
+        default: false
+      image:
+        description: 'Image reference without tag. Defaults to ghcr.io/<repo>/govulncheck'
+        type: string
+        default: ''
+      base-tag:
+        description: 'Slim base tag to build the offline image from'
+        type: string
+        default: 'latest-slim'
+      offline-tag:
+        description: 'Rolling tag for the offline image (not pinnable)'
+        type: string
+        default: 'latest-slim-offline'
+      runner:
+        type: string
+        default: 'ubuntu-latest'
+  workflow_dispatch:
+    inputs:
+      force:
+        type: boolean
+        default: false
+
+jobs:
+  offline:
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write      # sign the SBOM attestation
+      attestations: write  # store the attestation
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 1
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install crane
+        env:
+          CRANE_VERSION: 0.20.2
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -sSfL \
+            "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/bin" crane
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Detect database change
+        id: detect
+        env:
+          IMAGE_INPUT: ${{ inputs.image }}
+          REPO: ${{ github.repository }}
+          OFFLINE_TAG: ${{ inputs.offline-tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          image="$IMAGE_INPUT"
+          [ -n "$image" ] || image="ghcr.io/$REPO/govulncheck"
+          image=$(echo "$image" | tr '[:upper:]' '[:lower:]')
+
+          remote=$(curl -sSfL https://vuln.go.dev/index/db.json | jq -r '.modified')
+          published=$(crane config "$image:$OFFLINE_TAG" 2>/dev/null \
+            | jq -r '.config.Labels["de.askrella.vulndb.modified"] // "none"' || echo none)
+
+          echo "Remote DB modified:    $remote"
+          echo "Published image DB:    $published"
+
+          if [ "$FORCE" != "true" ] && [ "$remote" = "$published" ]; then
+            changed=false
+            echo "::notice::Offline DB already current ($remote); nothing to publish."
+          else
+            changed=true
+          fi
+          {
+            echo "image=$image"
+            echo "modified=$remote"
+            echo "changed=$changed"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download vulnerability database
+        if: ${{ steps.detect.outputs.changed == 'true' }}
+        run: |
+          set -euo pipefail
+          curl -sSfL https://vuln.go.dev/vulndb.zip -o vulndb.zip
+          mkdir -p vulndb && unzip -q vulndb.zip -d vulndb
+          ls vulndb
+          # Ensure the SBOM dir exists before the build COPYs it (filled next step).
+          mkdir -p sbom
+
+      - name: Set up Docker Buildx
+        if: ${{ steps.detect.outputs.changed == 'true' }}
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      # SBOM of the slim base, baked into the offline image (the DB is data, not
+      # packages, so the base SBOM describes the shipped software). Syft runs
+      # locally with the update check off.
+      - name: Generate SBOM for bundling
+        if: ${{ steps.detect.outputs.changed == 'true' }}
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        env:
+          SYFT_CHECK_FOR_APP_UPDATE: 'false'
+        with:
+          image: ${{ steps.detect.outputs.image }}:${{ inputs.base-tag }}
+          format: spdx-json
+          output-file: sbom/govulncheck.spdx.json
+          upload-artifact: false
+
+      - name: Build candidate (amd64, loaded for testing)
+        if: ${{ steps.detect.outputs.changed == 'true' }}
+        run: |
+          docker buildx build \
+            --build-arg BASE=${{ steps.detect.outputs.image }}:${{ inputs.base-tag }} \
+            --build-arg VULNDB_MODIFIED=${{ steps.detect.outputs.modified }} \
+            -f docker/govulncheck.offline.Dockerfile \
+            -t govulncheck:offline-candidate \
+            --load .
+
+      - name: Set up Go + cache
+        if: ${{ steps.detect.outputs.changed == 'true' }}
+        uses: ./.github/actions/go-setup-cache
+
+      - name: Vendor scenario for air-gapped test
+        if: ${{ steps.detect.outputs.changed == 'true' }}
+        working-directory: scenarios/vulnerable
+        # Air-gapped scanning needs modules available offline; vendoring makes the
+        # --network none run in the eval action self-contained.
+        run: go mod vendor
+
+      - name: Air-gapped smoke test (drift vs native)
+        if: ${{ steps.detect.outputs.changed == 'true' }}
+        uses: ./.github/actions/govulncheck-eval
+        with:
+          directory: scenarios/vulnerable
+          enable-native: true
+          enable-full: false
+          enable-slim: true
+          image: govulncheck
+          slim-tag: offline-candidate
+          offline: true
+          fail-on-drift: true
+
+      - name: Build and push multi-arch offline image
+        id: push
+        if: ${{ steps.detect.outputs.changed == 'true' }}
+        run: |
+          set -euo pipefail
+          image="${{ steps.detect.outputs.image }}"
+          tag="${{ inputs.offline-tag }}"
+          docker buildx build \
+            --build-arg BASE=${{ steps.detect.outputs.image }}:${{ inputs.base-tag }} \
+            --build-arg VULNDB_MODIFIED=${{ steps.detect.outputs.modified }} \
+            -f docker/govulncheck.offline.Dockerfile \
+            --platform linux/amd64,linux/arm64 \
+            -t "$image:$tag" \
+            --push .
+          digest=$(docker buildx imagetools inspect "$image:$tag" --format '{{.Manifest.Digest}}')
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Published offline image"
+            echo ""
+            echo "\`$image:$tag\` (amd64, arm64)"
+            echo ""
+            echo "DB modified: \`${{ steps.detect.outputs.modified }}\`. Rolling tag, not pinnable."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest SBOM (offline image)
+        if: ${{ steps.detect.outputs.changed == 'true' }}
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ steps.detect.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: sbom/govulncheck.spdx.json
+          push-to-registry: true
+
+      - name: Prune untagged versions
+        if: ${{ steps.detect.outputs.changed == 'true' }}
+        continue-on-error: true
+        # Best effort: removes orphaned manifests left behind when the rolling tag
+        # moved. May need a PAT with delete:packages for org-owned packages; the
+        # default GITHUB_TOKEN can be insufficient, hence continue-on-error.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -uo pipefail
+          # Package name follows the repo name, e.g. <repo>/govulncheck.
+          pkg="${REPO_NAME}/govulncheck"
+          enc=${pkg//\//%2F}
+          for scope in "orgs/$OWNER" "users/$OWNER"; do
+            ids=$(gh api "/$scope/packages/container/$enc/versions" --paginate 2>/dev/null \
+              | jq -r '.[] | select(((.metadata.container.tags // []) | length) == 0) | .id' 2>/dev/null) || continue
+            for id in $ids; do
+              echo "Deleting untagged version $id"
+              gh api -X DELETE "/$scope/packages/container/$enc/versions/$id" 2>/dev/null || true
+            done
+            break
+          done

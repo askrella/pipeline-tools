@@ -1,0 +1,34 @@
+name: Vuln DB refresh
+
+# Refreshes the offline slim image daily. ci-offline only rebuilds and pushes
+# when the database actually changed, so most runs are a cheap no-op check.
+
+on:
+  schedule:
+    # Daily at 06:17 UTC. The DB updates a few times a week, not every day, so
+    # most runs detect no change and exit early.
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Rebuild even if the database is unchanged'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vulndb
+  cancel-in-progress: false
+
+jobs:
+  offline:
+    permissions:
+      contents: read
+      packages: write
+      id-token: write      # ci-offline attests the SBOM
+      attestations: write
+    uses: ./.github/workflows/ci-offline.yml
+    with:
+      force: ${{ github.event_name == 'workflow_dispatch' && inputs.force || false }}

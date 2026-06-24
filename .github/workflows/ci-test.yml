@@ -1,0 +1,86 @@
+name: ci-test
+
+# Reusable unit that exercises the govulncheck composite action end to end
+# against the vulnerable scenario and asserts it reports the expected
+# advisories. Validates the action wrapper (inputs, outputs, exit handling)
+# against the currently published image.
+
+on:
+  workflow_call:
+    inputs:
+      directory:
+        description: 'Scenario directory to scan'
+        type: string
+        default: 'scenarios/vulnerable'
+      version:
+        description: 'Image tag the action should run'
+        type: string
+        default: 'latest-slim'
+      runner:
+        description: 'Runner label'
+        type: string
+        default: 'ubuntu-latest'
+  workflow_dispatch:
+    inputs:
+      directory:
+        type: string
+        default: 'scenarios/vulnerable'
+      version:
+        type: string
+        default: 'latest-slim'
+
+jobs:
+  action:
+    name: govulncheck action
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: read
+      packages: read
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 1
+
+      - name: Set up Go + cache
+        uses: ./.github/actions/go-setup-cache
+
+      - name: Resolve scenario modules
+        working-directory: ${{ inputs.directory }}
+        run: go mod download
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run govulncheck action
+        id: scan
+        uses: ./.github/actions/govulncheck
+        with:
+          directory: ${{ inputs.directory }}
+          version: ${{ inputs.version }}
+          # Test this repo's own image, so a fork or mirror exercises what it
+          # built rather than the canonical published image.
+          image: ghcr.io/${{ github.repository }}/govulncheck
+          fail-on-vuln: 'false' # we expect vulnerabilities in this scenario
+
+      - name: Validate output
+        env:
+          HAS_VULNS: ${{ steps.scan.outputs.has-vulnerabilities }}
+          SCAN_OUTPUT: ${{ steps.scan.outputs.scan-output }}
+        run: |
+          echo "has-vulnerabilities: $HAS_VULNS"
+          if [ "$HAS_VULNS" != "true" ]; then
+            echo "::error::expected has-vulnerabilities=true"
+            exit 1
+          fi
+          if printf '%s' "$SCAN_OUTPUT" | grep -q "GO-2021-0113\|GO-2022-1059"; then
+            echo "Found expected advisories"
+          else
+            echo "::error::expected advisories GO-2021-0113 / GO-2022-1059 not in output"
+            exit 1
+          fi

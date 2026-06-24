@@ -1,0 +1,82 @@
+name: Release
+
+# Cuts a versioned release. On a published GitHub Release we run the checks,
+# then build and push the versioned and latest images, then confirm the released
+# images still match the canonical tool with a drift check.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  lint:
+    uses: ./.github/workflows/ci-lint.yml
+
+  secret-scan:
+    uses: ./.github/workflows/ci-secret-scan.yml
+
+  test:
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/ci-test.yml
+
+  build:
+    needs: [lint, secret-scan, test]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write      # ci-build's publish job attests the SBOM
+      attestations: write
+    uses: ./.github/workflows/ci-build.yml
+    with:
+      push: true
+      slim: true
+      tags: 'latest ${{ github.event.release.tag_name }}'
+      tag-with-sha: false
+
+  # Call the eval action via its local path so this repo exercises its OWN copy
+  # of the action rather than a published version.
+  drift:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 1
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/govulncheck-eval
+        with:
+          directory: scenarios/vulnerable
+          pattern: './...'
+          image: ghcr.io/${{ github.repository }}/govulncheck
+          full-tag: latest
+          slim-tag: latest-slim
+          fail-on-drift: true
+
+  # Rebuild the offline image on the freshly released slim base (force, so it
+  # refreshes even when the DB itself has not changed since the last run).
+  offline:
+    needs: build
+    permissions:
+      contents: read
+      packages: write
+      id-token: write      # ci-offline attests the SBOM
+      attestations: write
+    uses: ./.github/workflows/ci-offline.yml
+    with:
+      force: true

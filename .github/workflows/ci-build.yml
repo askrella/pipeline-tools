@@ -1,0 +1,351 @@
+name: ci-build
+
+# Reusable unit that builds the govulncheck images (full + slim) for amd64 and
+# arm64 on native runners, smoke tests each against the vulnerable scenario, and
+# optionally pushes per-arch images plus multi-arch manifests for every tag.
+#
+# This is the single place image build logic lives. Triggers call it with
+# different inputs: PRs build without pushing, main pushes nightly tags, releases
+# push versioned tags.
+
+on:
+  workflow_call:
+    inputs:
+      push:
+        description: 'Push images and manifests to the registry'
+        type: boolean
+        default: false
+      slim:
+        description: 'Also build (and push) the docker-slim variant'
+        type: boolean
+        default: true
+      tags:
+        description: 'Space separated base tags for the full image (slim gets <tag>-slim)'
+        type: string
+        default: ''
+      tag-with-sha:
+        description: 'Append a sha-<short> tag to the list'
+        type: boolean
+        default: false
+      image:
+        description: 'Full image reference without tag. Defaults to ghcr.io/<repo>/govulncheck'
+        type: string
+        default: ''
+      registry:
+        description: 'Container registry'
+        type: string
+        default: 'ghcr.io'
+      runner-amd64:
+        description: 'Runner label for the amd64 build'
+        type: string
+        default: 'ubuntu-latest'
+      runner-arm64:
+        description: 'Runner label for the arm64 build'
+        type: string
+        default: 'ubuntu-24.04-arm'
+  workflow_dispatch:
+    inputs:
+      push:
+        type: boolean
+        default: false
+      slim:
+        type: boolean
+        default: true
+      tags:
+        type: string
+        default: 'manual'
+      tag-with-sha:
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ${{ inputs.runner-amd64 || 'ubuntu-latest' }}
+          - arch: arm64
+            runner: ${{ inputs.runner-arm64 || 'ubuntu-24.04-arm' }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 1
+
+      - name: Resolve Go version
+        id: go
+        uses: ./.github/actions/go-version
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build full image
+        run: |
+          docker build \
+            --build-arg GOLANG_VERSION=${{ steps.go.outputs.version }} \
+            -f docker/govulncheck.Dockerfile \
+            -t govulncheck .
+
+      - name: Smoke test full image
+        working-directory: scenarios/vulnerable
+        run: |
+          output=$(docker run --rm -v "$PWD":/app govulncheck:latest -scan=symbol . 2>&1 || true)
+          echo "$output"
+          if echo "$output" | grep -q "GO-2021-0113\|GO-2022-1059"; then
+            echo "Found expected vulnerabilities"
+          else
+            echo "::error::Expected vulnerabilities GO-2021-0113 / GO-2022-1059 not found"
+            exit 1
+          fi
+
+      - name: Install docker-slim
+        if: ${{ inputs.slim }}
+        env:
+          # Download the pinned release straight from GitHub. The upstream
+          # install script pulls from downloads.dockerslim.com, which is
+          # unreliable and has no working arm64 path. slimtoolkit publishes no
+          # checksums, so the pinned tag is the integrity bound we can assert.
+          SLIM_VERSION: '1.40.11'
+        run: |
+          set -euo pipefail
+          case "${{ matrix.arch }}" in
+            amd64) dir=dist_linux;       asset=dist_linux.tar.gz ;;
+            arm64) dir=dist_linux_arm64; asset=dist_linux_arm64.tar.gz ;;
+            *) echo "::error::unsupported arch ${{ matrix.arch }}"; exit 1 ;;
+          esac
+          curl -sSfL "https://github.com/slimtoolkit/slim/releases/download/${SLIM_VERSION}/${asset}" -o /tmp/slim.tar.gz
+          tar -xzf /tmp/slim.tar.gz -C /tmp
+          sudo install -m 0755 "/tmp/${dir}/slim" "/tmp/${dir}/docker-slim" "/tmp/${dir}/mint" "/tmp/${dir}/mint-sensor" /usr/local/bin/
+          # The release ships the sensor as mint-sensor; alias it so the
+          # docker-slim / slim entrypoints find their expected sensor name.
+          sudo cp /usr/local/bin/mint-sensor /usr/local/bin/docker-slim-sensor
+          sudo cp /usr/local/bin/mint-sensor /usr/local/bin/slim-sensor
+          docker-slim --version
+
+      - name: Build slim image
+        if: ${{ inputs.slim }}
+        working-directory: scenarios/vulnerable
+        run: |
+          docker-slim build \
+            --target govulncheck \
+            --cmd govulncheck \
+            --exec "govulncheck -scan=symbol . 2>&1 || true" \
+            --mount "$PWD/go.mod:/app/go.mod" \
+            --mount "$PWD/go.sum:/app/go.sum" \
+            --mount "$PWD/main.go:/app/main.go" \
+            --include-path "/usr/local/go/pkg/tool" \
+            --include-path "/usr/local/go/src" \
+            --http-probe=false
+
+      - name: Compress slim image
+        if: ${{ inputs.slim }}
+        working-directory: docker
+        run: |
+          docker buildx build \
+            --builder default \
+            --file govulncheck.compress.Dockerfile \
+            --cache-from govulncheck.slim \
+            --tag govulncheck.slim \
+            --output type=image,push=false,compression=zstd,compression-level=22 \
+            .
+
+      - name: Smoke test slim image
+        if: ${{ inputs.slim }}
+        working-directory: scenarios/vulnerable
+        run: |
+          output=$(docker run --rm -v "$PWD":/app govulncheck.slim -scan=symbol . 2>&1 || true)
+          echo "$output"
+          if echo "$output" | grep -q "GO-2021-0113\|GO-2022-1059"; then
+            echo "Found expected vulnerabilities"
+          else
+            echo "::error::slim image missed expected vulnerabilities"
+            exit 1
+          fi
+
+      - name: Image sizes
+        run: |
+          {
+            echo "### Image sizes (${{ matrix.arch }})"
+            echo ""
+            echo "| Image | Size |"
+            echo "| --- | --- |"
+            echo "| full | $(docker images govulncheck --format '{{.Size}}') |"
+            if [ "${{ inputs.slim }}" = "true" ]; then
+              echo "| slim | $(docker images govulncheck.slim --format '{{.Size}}') |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save images
+        if: ${{ inputs.push }}
+        run: |
+          mkdir -p artifacts
+          docker tag govulncheck:latest govulncheck:${{ matrix.arch }}
+          docker save govulncheck:${{ matrix.arch }} | gzip > artifacts/govulncheck-${{ matrix.arch }}.tar.gz
+          if [ "${{ inputs.slim }}" = "true" ]; then
+            docker tag govulncheck.slim govulncheck.slim:${{ matrix.arch }}
+            docker save govulncheck.slim:${{ matrix.arch }} | gzip > artifacts/govulncheck-slim-${{ matrix.arch }}.tar.gz
+          fi
+          ls -lh artifacts/
+
+      - name: Upload images
+        if: ${{ inputs.push }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: images-${{ matrix.arch }}
+          path: artifacts/
+          retention-days: 1
+
+  publish:
+    if: ${{ inputs.push }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write      # sign the SBOM attestation
+      attestations: write  # store the attestation
+    timeout-minutes: 15
+    steps:
+      - name: Download amd64 images
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: images-amd64
+          path: img-amd64/
+
+      - name: Download arm64 images
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: images-arm64
+          path: img-arm64/
+
+      - name: Load images
+        run: |
+          for f in img-amd64/*.tar.gz img-arm64/*.tar.gz; do
+            [ -f "$f" ] && docker load < "$f"
+          done
+          docker images | grep govulncheck
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Login to registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push images and manifests
+        id: push
+        env:
+          IMAGE_INPUT: ${{ inputs.image }}
+          REGISTRY: ${{ inputs.registry }}
+          REPO: ${{ github.repository }}
+          TAGS_INPUT: ${{ inputs.tags }}
+          TAG_WITH_SHA: ${{ inputs.tag-with-sha }}
+          SLIM: ${{ inputs.slim }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [ -n "$REGISTRY" ] || REGISTRY=ghcr.io
+          image="$IMAGE_INPUT"
+          [ -n "$image" ] || image="$REGISTRY/$REPO/govulncheck"
+          image=$(echo "$image" | tr '[:upper:]' '[:lower:]')   # ghcr requires lowercase
+
+          tags=()
+          for t in $TAGS_INPUT; do tags+=("$t"); done
+          if [ "$TAG_WITH_SHA" = "true" ]; then tags+=("sha-${SHA:0:7}"); fi
+          if [ "${#tags[@]}" -eq 0 ]; then
+            echo "::error::push=true but no tags provided"
+            exit 1
+          fi
+          echo "Publishing $image with tags: ${tags[*]}"
+
+          for tag in "${tags[@]}"; do
+            for arch in amd64 arm64; do
+              docker tag "govulncheck:$arch" "$image:$tag-$arch"
+              docker push "$image:$tag-$arch"
+            done
+            docker buildx imagetools create -t "$image:$tag" \
+              "$image:$tag-amd64" "$image:$tag-arm64"
+
+            if [ "$SLIM" = "true" ]; then
+              for arch in amd64 arm64; do
+                docker tag "govulncheck.slim:$arch" "$image:$tag-slim-$arch"
+                docker push "$image:$tag-slim-$arch"
+              done
+              docker buildx imagetools create -t "$image:$tag-slim" \
+                "$image:$tag-slim-amd64" "$image:$tag-slim-arm64"
+            fi
+          done
+
+          # All tags of a variant share one manifest digest. Expose the image and
+          # the full/slim digests so the SBOM steps can attest by digest.
+          first="${tags[0]}"
+          full_digest=$(docker buildx imagetools inspect "$image:$first" --format '{{.Manifest.Digest}}')
+          {
+            echo "image=$image"
+            echo "full_digest=$full_digest"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$SLIM" = "true" ]; then
+            slim_digest=$(docker buildx imagetools inspect "$image:$first-slim" --format '{{.Manifest.Digest}}')
+            echo "slim_digest=$slim_digest" >> "$GITHUB_OUTPUT"
+          fi
+
+          {
+            echo "### Published \`$image\`"
+            echo ""
+            for tag in "${tags[@]}"; do
+              echo "- \`$tag\` (amd64, arm64)"
+              [ "$SLIM" = "true" ] && echo "- \`$tag-slim\` (amd64, arm64)"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # SBOM + attestation. Syft catalogs locally (no data upload); the update
+      # check is disabled so the only egress is the action fetching its binary.
+      # The attestation is attached to the image in the registry and stored in
+      # the repo's private attestation store.
+      - name: Generate SBOM (full)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        env:
+          SYFT_CHECK_FOR_APP_UPDATE: 'false'
+        with:
+          image: ${{ steps.push.outputs.image }}@${{ steps.push.outputs.full_digest }}
+          format: spdx-json
+          output-file: sbom-full.spdx.json
+          upload-artifact: false
+
+      - name: Attest SBOM (full)
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ steps.push.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.full_digest }}
+          sbom-path: sbom-full.spdx.json
+          push-to-registry: true
+
+      - name: Generate SBOM (slim)
+        if: ${{ inputs.slim }}
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        env:
+          SYFT_CHECK_FOR_APP_UPDATE: 'false'
+        with:
+          image: ${{ steps.push.outputs.image }}@${{ steps.push.outputs.slim_digest }}
+          format: spdx-json
+          output-file: sbom-slim.spdx.json
+          upload-artifact: false
+
+      - name: Attest SBOM (slim)
+        if: ${{ inputs.slim }}
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ steps.push.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.slim_digest }}
+          sbom-path: sbom-slim.spdx.json
+          push-to-registry: true
