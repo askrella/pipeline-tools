@@ -22,14 +22,19 @@ jobs:
   secret-scan:
     uses: ./.github/workflows/ci-secret-scan.yml
 
+  # Test the action against the freshly published image, so this runs AFTER
+  # build (the image does not exist before the release publishes it).
   test:
+    needs: build
     permissions:
       contents: read
       packages: read
     uses: ./.github/workflows/ci-test.yml
+    with:
+      version: latest-slim
 
   build:
-    needs: [lint, secret-scan, test]
+    needs: [lint, secret-scan]
     permissions:
       contents: read
       packages: write

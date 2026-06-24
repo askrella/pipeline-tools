@@ -22,14 +22,8 @@ jobs:
   secret-scan:
     uses: ./.github/workflows/ci-secret-scan.yml
 
-  test:
-    permissions:
-      contents: read
-      packages: read
-    uses: ./.github/workflows/ci-test.yml
-
   build:
-    needs: [lint, secret-scan, test]
+    needs: [lint, secret-scan]
     permissions:
       contents: read
       packages: write
@@ -41,6 +35,17 @@ jobs:
       slim: true
       tags: 'nightly'
       tag-with-sha: true
+
+  # Test the action against the image build just pushed (nightly), so this runs
+  # AFTER build rather than against a possibly-absent latest-slim.
+  test:
+    needs: build
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/ci-test.yml
+    with:
+      version: nightly-slim
 
   # Call the eval action via its local path so this repo exercises its OWN copy
   # of the action (including local changes), not a published version. That
