@@ -18,7 +18,7 @@ RUN go install -ldflags="-s -w" golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_
 
 # Final image. Pinned to a digest (not the floating `latest`) for reproducible
 # builds; Dependabot's docker updater keeps the tag + digest fresh.
-FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
+FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 
 RUN apk add --no-cache ca-certificates git && update-ca-certificates
 # Copy required Go runtime files (no compiler)
